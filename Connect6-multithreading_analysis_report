@@ -1,0 +1,78 @@
+# Gamma Connect6 多线程与多进程实现分析报告
+
+本报告详细分析了 Gamma Connect6 项目中多线程与多进程的实现机制，涵盖了从 UI 交互到 AI 搜索内核，再到神经网络训练的各个层面。
+
+---
+
+## 1. 总体架构概述
+
+项目采用 C++ 作为核心引擎（Qt 框架），Python 用于神经网络训练。并发设计主要集中在以下三个维度：
+1. **UI 与 AI 隔离**：防止计算密集的搜索过程阻塞用户界面。
+2. **MCTS 搜索并线化**：利用多核 CPU 加速蒙特卡洛树搜索（MCTS）。
+3. **神经网络推理分检（Batching）**：集中处理多线程发出的推理请求，提高显卡/CPU 利用率。
+
+---
+
+## 2. C++ 核心引擎实现
+
+### 2.1 UI/AI 分离 (QThread)
+在 [game/connect6_ai_thread.h](file:///f:/AAA-z/ConnectSix2025_WuKuo.zip/ConnectSix2025_WuKuo/gamma_connect6-final/game/connect6_ai_thread.h) 中，项目定义了 [Connect6AIThread](file:///f:/AAA-z/ConnectSix2025_WuKuo.zip/ConnectSix2025_WuKuo/gamma_connect6-final/game/connect6_ai_thread.cpp#16-22) 类，继承自 `QThread`。
+- **作用**：当轮到 AI 下棋时，GUI 线程启动该子线程。
+- **机制**：AI 在子线程中调用 `Search::getAction` 进行重度计算，完成后通过信号 `ai_thread_finish_signal` 通知主线程更新棋盘。
+
+### 2.2 MCTS 树并行搜索 (Tree Parallelization)
+在 [ai_engine/Search.cpp](file:///f:/AAA-z/ConnectSix2025_WuKuo.zip/ConnectSix2025_WuKuo/gamma_connect6-final/ai_engine/Search.cpp) 的 [getAction](file:///f:/AAA-z/ConnectSix2025_WuKuo.zip/ConnectSix2025_WuKuo/gamma_connect6-final/ai_engine/Search.cpp#141-221) 方法中：
+- **线程数量**：默认开启了 **128 个线程** (`numThread` 定义为 128)。
+- **同步控制**：
+    - 使用 `std::thread` 创建多个 worker 线程，每个线程独立执行 `Search::calculation`。
+    - 使用 `std::atomic<int> is_end` 作为全局标志位，控制搜索在设定时间内停止。
+- **算法细节**：采用典型的树并行（Tree Parallelization）方案，多个线程共用一棵搜索树。
+
+### 2.3 神经网络推理批处理 (NN Server Thread)
+这是项目中一个非常精妙的设计。为了解决 128 个搜索线程频繁调用神经网络导致的单次推理延迟问题，项目引入了 **推理助手线程**：
+- **独立线程**：`nnserver` 线程在 [Search](file:///f:/AAA-z/ConnectSix2025_WuKuo.zip/ConnectSix2025_WuKuo/gamma_connect6-final/ai_engine/Search.h#60-62) 构造时启动，运行 [nn_evaluate](file:///f:/AAA-z/ConnectSix2025_WuKuo.zip/ConnectSix2025_WuKuo/gamma_connect6-final/ai_engine/Search.cpp#313-357) 方法。
+- **异步请求**：搜索线程通过 [predict_commit](file:///f:/AAA-z/ConnectSix2025_WuKuo.zip/ConnectSix2025_WuKuo/gamma_connect6-final/ai_engine/Search.cpp#291-312) 将棋盘特征放入 `MessageQueue`，并使用 `std::promise/future` 机制挂起等待结果。
+- **动态批处理 (Dynamic Batching)**：`nnserver` 线程会等待一定时间（如 1ms）或等待队列达到 `BatchSize`（默认 64），然后一次性调用 `torch::jit` 进行批处理推理，最后通过 `promise.set_value` 唤醒各个搜索线程。
+
+---
+
+## 3. 线程安全与同步机制
+
+由于 MCTS 树是共享的，项目使用了多层级锁机制：
+
+### 3.1 轻量级自旋锁 (SpinLock)
+- **文件**：[ai_engine/SpinLock.h](file:///f:/AAA-z/ConnectSix2025_WuKuo.zip/ConnectSix2025_WuKuo/gamma_connect6-final/ai_engine/SpinLock.h)
+- **实现**：基于 `std::atomic_flag` 的忙等锁。
+- **应用**：用于保护 [Node](file:///f:/AAA-z/ConnectSix2025_WuKuo.zip/ConnectSix2025_WuKuo/gamma_connect6-final/ai_engine/Node.h#9-46) 中的统计数据（如 `N` 访问次数、`Q` 胜率值）。因为这些数据的更新非常快，自旋锁比互斥量更高效。
+
+### 3.2 读写锁 (shared_mutex)
+- **应用**：`Node::nodeLock` 采用 `std::shared_mutex`。
+- **机制**：
+    - [select](file:///f:/AAA-z/ConnectSix2025_WuKuo.zip/ConnectSix2025_WuKuo/gamma_connect6-final/ai_engine/Node.cpp#23-57) 过程使用 `shared_lock`（读锁），允许多个线程同时遍历子节点。
+    - [expand](file:///f:/AAA-z/ConnectSix2025_WuKuo.zip/ConnectSix2025_WuKuo/gamma_connect6-final/ai_engine/Node.cpp#58-72) 或判断叶子节点状态时，根据需要获取读写锁，确保树结构在扩展时的完整性。
+
+### 3.3 虚拟损失 (Virtual Loss)
+- **原理**：在 `Node::select` 中，被选中的路径会临时增加 `virtualLoss`。
+- **目的**：鼓励多线程探索不同的分支，避免所有线程在同一时间内都挤在同一条当前最优路径上，从而提高搜索的并行效率和多样性。
+
+---
+
+## 4. Python 端的并发实现
+
+在 [train_connect6.py](file:///f:/AAA-z/ConnectSix2025_WuKuo.zip/ConnectSix2025_WuKuo/gamma_connect6-final/train_connect6.py) 中，主要采用了多进程数据加载：
+- **DataLoader**：在训练循环中，`DataLoader` 配置了 `num_workers=4`。
+- **机制**：利用 Python 的 `multiprocessing` 模块启动 4个子进程，并行地从磁盘读取 `.pkl` 数据文件、进行特征转换，并将其推送到 GPU 显存队列中，确保模型训练时不会因为 I/O 导致 GPU 等待。
+
+---
+
+## 5. 总结
+
+Gamma Connect6 的并发设计达到了工业级标准：
+1. **高性能**：128 线程充分榨干了多核 CPU 的性能。
+2. **高吞吐**：NN Batching 机制显著提升了深度学习模型的推理效率。
+3. **低开销**：自旋锁与读写锁的结合，在保证线程安全的同时，最大限度减少了上下文切换的开销。
+4. **响应性**：通过 Qt 的线程模型保证了界面的流畅。
+
+---
+**分析人**：Antigravity AI 助手
+**日期**：2026-03-18
